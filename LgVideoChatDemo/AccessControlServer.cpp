@@ -19,6 +19,7 @@
 #include "VideoServer.h"
 #include "TwoFactorAuth.h"
 #include "Logger.h"
+#include "TimeUtil.h"
 
 #pragma comment(lib, "libssl.lib")
 #pragma comment(lib, "libcrypto.lib")
@@ -59,38 +60,24 @@ void setMacro(SOCKET __InputSock, TRegistration* regData);
 bool sendCommandOnlyMsg(TSocketManager *smgr, sockaddr_in sockip, int socklen, bool answer);
 bool sendStatusMsg(TSocketManager *smgr, sockaddr_in sockip, int socklen, char* cid, TStatus status);
 int findReceiverIP(char* recID, sockaddr_in* out);
-SSL* ssl;
-SSL_CTX* sslContext;
+SSL* ssl[10];
+SSL_CTX* sslContext[10];
+int sslInx = 0;
+int sslCTXInx = 0;
 
 int verify_callback(int preverify_ok, X509_STORE_CTX* ctx);
 void log_callback(const SSL* ssl, int where, int ret);
+int allowEarlyDataCallback(SSL* ssl, void* arg)
+{
+	printf("allowEarlyDataCallback\n");
+	return SSL_EARLY_DATA_ACCEPTED;
+}
 
 // start Server
 bool StartACServer(bool &Loopback)
 {
-
 	SSL_library_init();
 	SSL_load_error_strings();
-	sslContext = SSL_CTX_new(SSLv23_server_method());
-	SSL_CTX_set_verify(sslContext, SSL_VERIFY_PEER, verify_callback);
-	SSL_CTX_set_info_callback(sslContext, log_callback);
-	if (sslContext == NULL)
-	{
-		fprintf(stderr, "Failed to create SSL context.\n");
-		return 1;
-	}
-
-	if (SSL_CTX_use_certificate_file(sslContext, "server.crt", SSL_FILETYPE_PEM) != 1)
-	{
-		fprintf(stderr, "Failed to load server certificate.\n");
-		return 1;
-	}
-	if (SSL_CTX_use_PrivateKey_file(sslContext, "server.key", SSL_FILETYPE_PEM) != 1)
-	{
-		fprintf(stderr, "Failed to load server private key.\n");
-		return 1;
-	}
-	std::cout << "load key done" << std::endl;
 
 	if (hThreadACServer == INVALID_HANDLE_VALUE)
 	{
@@ -98,6 +85,8 @@ bool StartACServer(bool &Loopback)
 	}
 	return true;
 }
+
+bool StopAccessControlClient(void);
 
 // stop Server
 bool StopACServer(void)
@@ -111,6 +100,7 @@ bool StopACServer(void)
 		hThreadACServer = INVALID_HANDLE_VALUE;
 	}
 	CleanUpACServer();
+	StopAccessControlClient();
 
 	return true;
 }
@@ -241,6 +231,15 @@ static DWORD WINAPI ThreadACServer(LPVOID ivalue)
 		std::cout << "socket() failed with error " << WSAGetLastError() << std::endl;
 		return 1;
 	}
+	int ret = BIO_set_tcp_ndelay(Listener, 1);
+	if (ret < 0) {
+		BIO_closesocket(Listener);
+		return 0;
+	}
+	ret = 0;
+
+	int opt = 1;
+	setsockopt(Listener, IPPROTO_TCP, /*TCP_FASTOPEN_CONNECT*/30, (char*)&opt, sizeof(opt));
 
 	// create Events handles
 	std::cout << "create ACServer event....." << std::endl;
@@ -254,9 +253,8 @@ static DWORD WINAPI ThreadACServer(LPVOID ivalue)
 		return 1;
 	}
 
-
 	InternetAddr.sin_family = AF_INET;
-	inet_pton(AF_INET, ACS_IP, &InternetAddr.sin_addr.s_addr);
+	inet_pton(AF_INET, "0.0.0.0", &InternetAddr.sin_addr.s_addr);
 	InternetAddr.sin_port = htons(ACS_PORT);
 	std::cout << "bind ACServer event....." << std::endl;
 	if (bind(Listener, (PSOCKADDR)&InternetAddr, sizeof(InternetAddr)) == SOCKET_ERROR)
@@ -339,8 +337,43 @@ static DWORD WINAPI ThreadACServer(LPVOID ivalue)
 
 							LARGE_INTEGER liDueTime;
 
+							sslContext[sslCTXInx] = SSL_CTX_new(SSLv23_server_method());
+							SSL_CTX_set_max_early_data(sslContext[sslCTXInx], 1024);
+							SSL_CTX_set_verify(sslContext[sslCTXInx], SSL_VERIFY_PEER, verify_callback);
+							SSL_CTX_set_info_callback(sslContext[sslCTXInx], log_callback);
+							SSL_CTX_set_allow_early_data_cb(sslContext[sslCTXInx], allowEarlyDataCallback, NULL);
+							if (sslContext[sslCTXInx] == NULL)
+							{
+								fprintf(stderr, "Failed to create SSL context.\n");
+								return 1;
+							}
+
+							if (SSL_CTX_use_certificate_file(sslContext[sslCTXInx], "server.crt", SSL_FILETYPE_PEM) != 1)
+							{
+								fprintf(stderr, "Failed to load server certificate.\n");
+								return 1;
+							}
+							if (SSL_CTX_use_PrivateKey_file(sslContext[sslCTXInx], "server.key", SSL_FILETYPE_PEM) != 1)
+							{
+								fprintf(stderr, "Failed to load server private key.\n");
+								return 1;
+							}
+							std::cout << "load key done" << std::endl;
+
+							ssl[sslInx] = SSL_new(sslContext[sslCTXInx]);
+
 							// Accept a new connection, and add it to the socket and event lists
 							tmp.ASocket = accept(Listener, (struct sockaddr*)&sa, &sa_len);
+							int opt = 1;
+							setsockopt(tmp.ASocket, IPPROTO_TCP, /*TCP_FASTOPEN_CONNECT*/30, (char*)&opt, sizeof(opt));
+
+							int ret = BIO_set_tcp_ndelay(tmp.ASocket, 1);
+							if (ret < 0) {
+								BIO_closesocket(tmp.ASocket);
+								return 0;
+
+							}
+							ret = 0;
 
 							if (tmp.ASocket == INVALID_SOCKET)
 							{
@@ -348,28 +381,29 @@ static DWORD WINAPI ThreadACServer(LPVOID ivalue)
 								return 1;
 							}
 
-							ssl = SSL_new(sslContext);
-
 							if (ssl == NULL)
 							{
 								fprintf(stderr, "Failed to create SSL socket.\n");
 								return 1;
 							}
 
-							if (SSL_set_fd(ssl, tmp.ASocket) != 1)
+							if (SSL_set_fd(ssl[sslInx], tmp.ASocket) != 1)
 							{
 								fprintf(stderr, "Failed to bind SSL socket.\n");
 								return 1;
 							}
 
-							int result = SSL_accept(ssl);
+							int result = SSL_accept(ssl[sslInx]);
 							if (result != 1)
 							{
-								fprintf(stderr, "Failed to perform SSL handshake.\n");
-								return 1;
+								printf("Failed to perform SSL handshake.\n");
+								//return 1;
 							}
 
-							tmp.ssl = ssl;
+							tmp.ssl = ssl[sslInx];
+
+							sslInx++;
+							sslCTXInx++;
 
 							int err = getnameinfo((struct sockaddr*)&sa, sa_len, RemoteIp, sizeof(RemoteIp), 0, 0, NI_NUMERICHOST);
 							if (err != 0) {
@@ -449,13 +483,13 @@ static DWORD WINAPI ThreadACServer(LPVOID ivalue)
 					}
 					else
 					{
-						char testText[4096] = {0,};
+						char testText[8192] = {0,};
 						int result = 0;
 						sockaddr_in saFrom{};
 						int nFromLen = sizeof(sockaddr_in);
 						size_t recieved;
 
-						if (SSL_read_ex(sockmng[dwEvent - 2].ssl, testText, sizeof(testText), &recieved) > 0)
+						if (SSL_read_ex(sockmng[dwEvent - 2].ssl, testText, sizeof(testText) - 1, &recieved) > 0)
 						{
 							//std::cout << "Received : " << testText << std::endl;
 							RecvHandler(&sockmng[dwEvent - 2], testText, recieved, saFrom, nFromLen);
@@ -516,16 +550,18 @@ static DWORD WINAPI ThreadACServer(LPVOID ivalue)
 	return 0;
 }
 
-void ResetAttempt(LPVOID lpArgToCompletionRoutine, DWORD dwTimerLowValue, DWORD dwTimerHighValue)
+VOID CALLBACK ResetLoginAttempt(PVOID lpParameter, BOOLEAN TimerOrWaitFired)
 {
 	printf("reset attempt count\n");
-	TRegistration* user = (TRegistration*)lpArgToCompletionRoutine;
+	TRegistration* user = (TRegistration*)lpParameter;
 	user->LoginAttempt = 0;
 }
 
 static int RecvHandler(TSocketManager *smgr, char* data, int datasize, sockaddr_in sockip, int socklen )
 {
 	oCommandOnly *getMsg = (oCommandOnly*) data;
+
+	printf("RecvHandler = %c\n", getMsg->MessageType);
 
 	switch (getMsg->MessageType)
 	{
@@ -536,8 +572,29 @@ static int RecvHandler(TSocketManager *smgr, char* data, int datasize, sockaddr_
 		// Store Data - memory / storage
 		std::cout << "get registration infomation" << std::endl;
 
+		for (TRegistration* user : controlDevices)
+		{
+			TRspResultWithMessage rsp{};
+			rsp.MessageType = RegistrationResponse;
+			rsp.answer = false;
+			if (!strncmp(user->ContactID, regData->ContactID, NAME_BUFSIZE))
+			{
+				memcpy((char *)rsp.Message, "Duplicated ConntactID", strlen("Duplicated ConntactID"));
+				rsp.MessageLen = strlen("Duplicated ConntactID");
+				return SSL_write(smgr->ssl, &rsp, sizeof(rsp));
+			}
+			if (!strncmp(user->email, regData->email, EMAIL_BUFSIZE))
+			{
+				memcpy((char*)rsp.Message, "Duplicated Email", strlen("Duplicated ConntactID"));
+				rsp.MessageLen = strlen("Duplicated Email");
+				return SSL_write(smgr->ssl, &rsp, sizeof(rsp));
+			}
+		}
+
 		// macro
 		setMacro(smgr->ASocket, regData);
+
+		GetCurrentDateTime(regData->LastPasswordChange, sizeof(regData->LastPasswordChange));
 
 		if (RegistrationUserData(regData))
 		{
@@ -577,9 +634,9 @@ static int RecvHandler(TSocketManager *smgr, char* data, int datasize, sockaddr_
 		std::vector<TRegistration*>::iterator iter;
 		for (iter = controlDevices.begin(); iter != controlDevices.end(); iter++)
 		{
-			if (!strncmp((*iter)->email, LoginData->email, (*iter)->EmailSize))
+			if (!strncmp((*iter)->email, LoginData->email, LoginData->EmailSize))
 			{
-				if (!strncmp((*iter)->password, LoginData->passwordHash, (*iter)->PasswordSize))
+				if (!strncmp((*iter)->password, LoginData->passwordHash, LoginData->PasswordHashSize))
 				{
 					//resp = Connected;
 
@@ -610,17 +667,20 @@ static int RecvHandler(TSocketManager *smgr, char* data, int datasize, sockaddr_
 					if ((*iter)->LoginAttempt > MAX_ALLOW_LOGIN_ATTEMPT)
 					{
 						std::cout << "Login restricted - Too Many Login attempt" << std::endl;
-						HANDLE hTimer = CreateWaitableTimer(NULL, FALSE, NULL);
+						HANDLE hTimer = NULL;
+						HANDLE hTimerQueue = CreateTimerQueue();
 
-						if (!hTimer) {
-							printf("hTimer is null\n");
+						if (!hTimerQueue) {
+							printf("hTimerQueue is null\n");
 							break;
 						}
 
-						LARGE_INTEGER dueTime;
-						dueTime.QuadPart = -10000000000;
-						SetWaitableTimer(hTimer, &dueTime, 0, ResetAttempt, (LPVOID)(*iter), FALSE);
-						DWORD result = WaitForSingleObject(hTimer, INFINITE);
+						//if (!CreateTimerQueueTimer(&hTimer, hTimerQueue, ResetLoginAttempt, user, 3600000, 0, 0)) {
+						if (!CreateTimerQueueTimer(&hTimer, hTimerQueue, ResetLoginAttempt, (*iter), 10000, 0, 0)) {
+							printf("hTimerQueue is null\n");
+							break;
+						}
+
 						break;
 					}
 				}
@@ -655,6 +715,19 @@ static int RecvHandler(TSocketManager *smgr, char* data, int datasize, sockaddr_
 					{
 						if (!strcmp((*iter)->ContactID, myCID))
 						{
+							SYSTEMTIME CurTime, LastPasswordChangedTime;
+							GetLocalTime(&CurTime);
+							ConvertDateTime((*iter)->LastPasswordChange, &LastPasswordChangedTime);
+
+							if (IsTimeDifferenceGreaterThanOneMonth(CurTime, LastPasswordChangedTime))
+							{
+								TRspWithMessage rsp{};
+								rsp.MessageType = LoginResponse;
+								rsp.MessageLen = strlen("Password need to be updated. it changed one month ago.");
+								memcpy(rsp.Message, "Password need to be updated. it changed one month ago.", strlen("Password need to be updated.it changed one month ago."));
+								return SSL_write(smgr->ssl, &rsp, sizeof(rsp));
+							}
+
 							strcpy_s((*iitt).Owner, myCID);
 							strcpy_s((*iter)->LastIPAddress, (*iitt).IPAddr);
 							std::cout << "Login Information : " << (*iter)->email << " / " << myCID << " / " << (*iitt).IPAddr << std::endl;
@@ -912,9 +985,12 @@ static int RecvHandler(TSocketManager *smgr, char* data, int datasize, sockaddr_
 			{
 				std::cout << "Re-Registration Password to " << (*iter)->email << std::endl;
 				memcpy((*iter)->password, msg->password, msg->PasswordSize);
+				GetCurrentDateTime((*iter)->LastPasswordChange, sizeof((*iter)->LastPasswordChange));
 				break;
 			}
 		}
+		// ? update
+		RegistrationToFile();
 
 		TStatusInfo* feedback = (TStatusInfo*)std::malloc(sizeof(TStatusInfo));
 
