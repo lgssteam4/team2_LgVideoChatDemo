@@ -698,7 +698,7 @@ static int RecvHandler(TSocketManager *smgr, char* data, int datasize, sockaddr_
 		TStatus resp = Disconnected;
 		char myCID[NAME_BUFSIZE] = "None";
 		std::cout << "RECEIVED TOKEN : " << tMsg->TFA << std::endl;
-		int iResult = ReadTFA(tMsg->TFA);
+		int iResult = ReadTFA(tMsg->myCID, tMsg->TFA);
 		if (iResult == TFA_SUCCESS)
 		{
 			resp = Connected;
@@ -952,7 +952,7 @@ static int RecvHandler(TSocketManager *smgr, char* data, int datasize, sockaddr_
 		std::cout << "RECEIVED TOKEN : " << tMsg->TFA << std::endl;
 		TStatusInfo* feedback = (TStatusInfo*)std::malloc(sizeof(TStatusInfo));
 
-		int iResult = ReadTFA(tMsg->TFA);
+		int iResult = ReadTFA(tMsg->myCID, tMsg->TFA);
 		if (iResult == TFA_SUCCESS)
 		{
 			feedback->status = ResetPassword;
@@ -1145,6 +1145,15 @@ int findReceiverIP(char* recID, sockaddr_in *out)
 	return 0;
 }
 
+char* searchConnectID(char* CID)
+{
+	for (auto iter = controlDevices.begin(); iter != controlDevices.end(); iter++)
+	{
+		if (!strcmp(CID, (*iter)->ContactID))
+			return (*iter)->email;
+	}
+	return CID;
+}
 
 
 int _tmain(int argc, _TCHAR* argv[])
